@@ -5,6 +5,7 @@ credentials.json
 # NetSuite exports — temporary, daily files
 *.xls
 *.xlsx
+*.csv
 
 # Generated reports
 consolidation_report_*.csv
