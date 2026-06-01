@@ -1,153 +1,166 @@
 # Order Consolidation Checker
 
-自动分析 NetSuite 订单，识别可合并发货的订单组，并将结果写回 Google Sheet。
+Automatically identifies which open orders can be shipped together, and writes the recommendations back to a Google Sheet — saving daily manual review time for warehouse and logistics teams.
 
 ---
 
-## 功能概览
+## How It Works
 
-| 步骤 | 说明 |
-|------|------|
-| 读取数据 | 从 Google Sheet 追踪表 + NetSuite 导出的 IF 表（`.xls`）读取订单信息 |
-| 维护历史 | 将 IF 数据 upsert 到 `IF_history` tab，自动清理已完成的 SO |
-| 合单分析 | 按账号 + ZIP 分组，基于发货日 / 抓货日时间窗口判断哪些订单可以合并发货 |
-| 写回结果 | 将合单建议写入 Google Sheet 的 `Note` 列，保留人工已有备注 |
-| 本地报告 | 导出 CSV 报告至当前目录 |
-
----
-
-## 环境要求
-
-- Python 3.8+
-- 依赖库：
-
-```bash
-pip install pandas gspread google-auth
+```
+NetSuite IF Export (.xls)         Google Sheet Tracker
+         │                                │
+         └──────────────┬─────────────────┘
+                        ▼
+              Load & Normalize Data
+                        │
+                        ▼
+           Upsert IF_history Tab
+         (track pick dates per SO)
+                        │
+                        ▼
+          Eligibility Filter
+    (status whitelist + exclude accounts)
+                        │
+                        ▼
+       Group by ACCT# + ZIP Code
+                        │
+                        ▼
+      Pairwise Time Window Check
+   (ship deadline diff OR pick date diff ≤ 3 days)
+                        │
+                        ▼
+      Large-Order Safety Check
+    (no-IF order with QTY > 300 → warn & skip)
+                        │
+                        ▼
+        Clique Validation
+  (every pair in a group must be compatible)
+                        │
+                        ▼
+    Write Recommendations to Note Column
+         + Export Local CSV Report
 ```
 
 ---
 
-## 使用方法
+## Features
 
-### 1. 准备文件
+- **Smart grouping** — groups by account + ZIP, then validates every pair in a group before merging (no false positives from transitive matches)
+- **Dual time signal** — uses either the promised ship date or the NetSuite pick date, whichever is available
+- **Large-order guard** — prevents merging a tracked order with an untracked high-QTY order that might delay shipment
+- **Non-destructive writes** — human notes in the sheet are never overwritten; only the `[Auto]` section is refreshed
+- **IF history tracking** — maintains a running `IF_history` tab so pick dates persist across daily runs
+- **Urgency flags** — highlights orders due within 2 days (🔴) or 4 days (🟡)
 
-| 文件 | 说明 |
-|------|------|
-| `ItemFulfillments.xls` | 从 NetSuite 导出的当日 IF 表（Excel XML 格式） |
-| `credentials.json` | Google Service Account 凭证文件 |
+---
 
-> NetSuite 导出时请选择 **Excel**（SpreadsheetML `.xls`）格式，不是 CSV 或二进制 xlsx。
+## Quick Start
 
-### 2. 配置 `CONFIG`
-
-打开 `consolidation_checker.py`，根据实际情况修改顶部的 `CONFIG` 字典：
-
-```python
-CONFIG = {
-    "sheet_id":       "你的 Google Sheet ID",
-    "tracking_tab":   "2026",           # 追踪表 tab 名
-    "if_history_tab": "IF_history",     # IF 历史 tab（首次运行自动创建）
-    "if_xls_path":    "ItemFulfillments.xls",
-    "credentials_file": "credentials.json",
-    ...
-}
-```
-
-### 3. 运行
+### 1. Install dependencies
 
 ```bash
-# 交互模式（运行后询问是否写回）
+pip install -r requirements.txt
+```
+
+### 2. Set up Google credentials
+
+Create a [Google Service Account](https://docs.gspread.org/en/latest/oauth2.html), download the JSON key, and save it as `credentials.json` in the project root.
+
+Share your Google Sheet with the service account email.
+
+### 3. Configure
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+```
+
+Or edit `config.py` directly.
+
+### 4. Export from NetSuite
+
+Export today's Item Fulfillment report from NetSuite as **Excel** (SpreadsheetML `.xls` format — not CSV or binary xlsx).
+
+Save it to the project root as `ItemFulfillments.xls` (or update `IF_XLS_PATH` in your config).
+
+### 5. Run
+
+```bash
+# Interactive — asks before writing back to Sheet
 python consolidation_checker.py
 
-# 直接写回 Google Sheet
+# Write results directly without prompt
 python consolidation_checker.py --write
 
-# 仅分析，不写回
+# Analyze only, do not modify Sheet
 python consolidation_checker.py --dry-run
 ```
 
----
-
-## Google Sheet 格式要求
-
-| 要求 | 说明 |
-|------|------|
-| 表头行 | 第 **3** 行为列名，第 4 行起为数据 |
-| 必要列 | `Order Date`、`ACCT#`、`ZIP CODE`、`SO#`、`Status`、`Note`、`normal shipped date`、`QTY` |
+See [`examples/outputs/sample_terminal_output.md`](examples/outputs/sample_terminal_output.md) for what to expect.
 
 ---
 
-## 合单逻辑
+## Google Sheet Requirements
 
-```
-同一 ACCT# + ZIP CODE
-    └─ 发货日相差 ≤ 3 天  或  抓货日相差 ≤ 3 天
-        └─ 排除：一方有 IF 记录、另一方无 IF 且 QTY > 300
-            └─ Clique 检验：组内任意两张都满足时间窗口才归为同一合单组
-```
-
-**参与分析的 Status（精确匹配，不区分大小写）：**
-
-| Status | 说明 |
-|--------|------|
-| `stock order` | 未处理，可合并 |
-| `fcsrepleshing` | 补货中，可合并 |
-| `hold` | 等待中，可合并 |
-| `send`（今日） | 当天给了 shipping，还来得及合并 |
+| Requirement | Detail |
+|-------------|--------|
+| Header row | Row **3** contains column names; data starts at row 4 |
+| Required columns | `Order Date`, `ACCT#`, `ZIP CODE`, `SO#`, `Status`, `Note`, `normal shipped date`, `QTY` |
+| Optional column | `SEND DATE` — used to detect same-day send orders |
 
 ---
 
-## Note 列写入格式
-
-脚本以 `[自动]` 为标识追加建议，不覆盖人工内容：
+## Project Structure
 
 ```
-人工备注  [自动]可与 SO12345、SO67890 合发 | 已抓货:5/28
+consolidation_checker/
+├── consolidation_checker.py     # Main script
+├── config.py                    # Centralized configuration (env-aware)
+├── requirements.txt
+├── .env.example                 # Config template
+├── .gitignore
+├── docs/
+│   └── consolidation_logic.md  # Detailed logic explanation
+└── examples/
+    └── outputs/
+        └── sample_terminal_output.md
 ```
 
-再次运行时，`[自动]` 之后的内容会被刷新，人工部分保持不变。
+> `credentials.json` and `ItemFulfillments.xls` are excluded by `.gitignore` — never commit them.
 
 ---
 
-## 输出示例
+## Consolidation Rules (Summary)
 
-```
-=======================================================
-  ✅ 可合单 SO：6 张，共 3 组
-  ⚠️  放弃合并警告：1 张
-  🔴 紧急/过期：2 张
-=======================================================
+Two orders can be consolidated when:
 
-合单明细：
-  合单组1  🔴 紧急
-    📦有IF  QTY:120  截止6/2  SO:100001
-      无IF  QTY:80   截止6/3  SO:100045
-  合单组2
-    📦有IF  QTY:200  截止6/5  SO:100078
-    📦有IF  QTY:150  截止6/6  SO:100089
-```
+1. They share the same `ACCT#` and `ZIP CODE`
+2. Their ship deadlines **or** NetSuite pick dates are within **3 days** of each other
+3. Neither order is blocked by the large-order safety check
+4. Every other order in the proposed group also satisfies rule 2 with them (clique requirement)
+
+For the full logic with examples, see [`docs/consolidation_logic.md`](docs/consolidation_logic.md).
 
 ---
 
-## 文件结构
+## Configuration Reference
 
-```
-.
-├── consolidation_checker.py   # 主程序
-├── credentials.json           # Google 凭证（不提交到 Git）
-├── ItemFulfillments.xls       # 当日 NetSuite 导出（不提交到 Git）
-└── consolidation_report_YYYYMMDD.csv  # 自动生成的本地报告
-```
-
-> `credentials.json` 和 `.xls` 文件包含敏感信息或临时数据，请添加到 `.gitignore`，不要提交。
+| Key | Default | Description |
+|-----|---------|-------------|
+| `consolidate_window` | `3` | Max days between deadlines/pick dates to allow merging |
+| `expiry_days` | `7` | Fallback deadline = order date + this value |
+| `urgent_days` | `2` | Orders due within N days are flagged 🔴 |
+| `large_qty_threshold` | `300` | No-IF orders above this QTY are excluded from merging |
+| `exclude_accts` | `["5042"]` | Account numbers never included in consolidation |
 
 ---
 
-## 常见错误
+## Troubleshooting
 
-| 错误信息 | 原因 & 解决方法 |
-|----------|----------------|
-| `❌ 找不到 IF 表文件` | `ItemFulfillments.xls` 不在当前目录，检查路径或 `CONFIG["if_xls_path"]` |
-| `❌ IF 表解析失败` | 导出格式不是 SpreadsheetML，重新从 NetSuite 选择 Excel 格式导出 |
-| `❌ 找不到 credentials.json` | 缺少 Google Service Account 凭证，参考 [官方文档](https://docs.gspread.org/en/latest/oauth2.html) 创建 |
-| `⚠️ 追踪表缺少以下列` | `CONFIG` 中的列名与 Sheet 实际列名不一致，对照 Sheet 第3行修改 `CONFIG` |
+| Error | Cause & Fix |
+|-------|-------------|
+| `❌ IF table file not found` | `ItemFulfillments.xls` missing — check path or `IF_XLS_PATH` in config |
+| `❌ IF table parse failed` | Wrong export format — re-export from NetSuite as Excel (SpreadsheetML) |
+| `❌ credentials.json not found` | Missing service account key — see [gspread auth docs](https://docs.gspread.org/en/latest/oauth2.html) |
+| `⚠️ Tracker missing columns` | Column name mismatch — compare config keys against row 3 of your Sheet |

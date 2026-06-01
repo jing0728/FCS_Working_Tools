@@ -1,15 +1,14 @@
 """
 Order Consolidation Checker
 ============================
-功能：
-  1. 读取 Google Sheet 追踪表 + NetSuite IF 表
-  2. 将 IF 数据 upsert 到 IF_history tab，并清理已完成的 SO
-  3. 按完整合并逻辑分析可合单订单，结果写回 Note 列
+Reads a Google Sheet order tracker and a NetSuite Item Fulfillment export,
+identifies orders that can be consolidated into a single shipment, and writes
+the recommendations back to the Sheet's Note column.
 
-使用方法：
-  1. 从 NetSuite 导出当日 IF 表（.xls），放到本目录
-  2. 配置下方 CONFIG
-  3. python consolidation_checker.py
+Usage:
+  1. Export today's IF table from NetSuite as Excel XML (.xls)
+  2. Place it in this directory (or set IF_XLS_PATH in .env)
+  3. Run:  python consolidation_checker.py [--write | --dry-run]
 """
 
 import pandas as pd
@@ -20,37 +19,7 @@ from datetime import datetime, timedelta
 from itertools import combinations
 import sys, os, re
 
-# ─────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────
-CONFIG = {
-    "sheet_id":         "1kARjfsVweCBXcaS77a_CB3KiE92DgIOajoQ6IJ8wSCY",
-    "tracking_tab":     "2026",           # 追踪表 tab 名
-    "if_history_tab":   "IF_history",     # IF 历史 tab（自动创建）
-    "if_xls_path":      "ItemFulfillments.xls",
-    "credentials_file": "credentials.json",
-
-    # 追踪表列名
-    "col_order_date":   "Order Date",
-    "col_acct":         "ACCT#",
-    "col_zip":          "ZIP CODE",
-    "col_so":           "SO#",
-    "col_status":       "Status",
-    "col_note":         "Note",
-    "col_shipped_date": "normal shipped date",
-    "col_send_date":    "SEND DATE",
-    "col_qty":          "QTY",
-
-    # 排除不参与合单的账号（如 5042 是内部账号）
-    "exclude_accts": ["5042"],
-
-    # 合并参数
-    "expiry_days":          7,    # 订单有效期（兜底用）
-    "urgent_days":          2,    # 紧急预警天数
-    "consolidate_window":   3,    # 发货日 / 抓货日相差 ≤ N 天可合并
-    "large_qty_threshold":  300,  # 无 IF 记录时，QTY 超过此值视为抓货时间过长
-}
-# ─────────────────────────────────────────
+from config import CONFIG
 
 
 # ══════════════════════════════════════════
