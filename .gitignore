@@ -1,0 +1,6 @@
+credentials.json
+*.xls
+*.xlsx
+consolidation_report_*.csv
+__pycache__/
+*.pyc
