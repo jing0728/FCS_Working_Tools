@@ -16,7 +16,8 @@ Usage:
       --sales      "FCSSalesbyItemSummary.xls" \
       --sales-days 61 \
       --lead-time  30 \
-      --safety-days 14
+      --safety-days 14 \
+      --moq 10
 """
 
 import argparse
@@ -148,12 +149,19 @@ class ForecastRow:
     status: str               # OUT_OF_STOCK / REORDER_NOW / LOW / WATCH / OK / SLOW_MOVER / NO_SALES
 
 
+def _round_up_to_moq(qty: float, moq: int) -> int:
+    if qty <= 0:
+        return 0
+    return math.ceil(qty / moq) * moq
+
+
 def classify(
     row_data: dict,
     sales: dict[str, float],
     sales_days: int,
     lead_time: int,
     safety_days: int,
+    moq: int = 1,
 ) -> ForecastRow:
     item = row_data["item"]
     qty_sold = sales.get(item, 0.0)
@@ -184,6 +192,7 @@ def classify(
     # Suggested order: bring stock up to preferred stock level (or 60-day supply)
     target = pref_stock if pref_stock > 0 else daily * 60
     suggested_order = max(0.0, target - (curr_avail + row_data["on_order"]))
+    suggested_order = _round_up_to_moq(suggested_order, moq)
 
     # Status tiers
     if on_hand <= 0 and qty_sold > 0:
@@ -216,7 +225,7 @@ def classify(
         daily_sales=round(daily, 3),
         days_of_stock=round(days_of_stock, 1) if days_of_stock != float("inf") else 9999,
         reorder_signal=round(reorder_signal, 1) if reorder_signal != float("inf") else 9999,
-        suggested_order=math.ceil(suggested_order),
+        suggested_order=suggested_order,
         status=status,
     )
 
@@ -248,6 +257,7 @@ def run(
     sales_days: int = 61,
     lead_time: int = 30,
     safety_days: int = 14,
+    moq: int = 1,
     output_full: str = "inventory_forecast_report.csv",
     output_action: str = "reorder_now.csv",
 ):
@@ -262,7 +272,7 @@ def run(
     print("\nCalculating forecasts...")
     rows = []
     for item_data in inventory.values():
-        rows.append(classify(item_data, sales, sales_days, lead_time, safety_days))
+        rows.append(classify(item_data, sales, sales_days, lead_time, safety_days, moq))
 
     rows.sort(key=lambda r: (STATUS_ORDER.get(r.status, 9), r.days_of_stock))
 
@@ -272,7 +282,7 @@ def run(
 
     print("\n" + "=" * 60)
     print("  INVENTORY FORECAST SUMMARY")
-    print(f"  Lead time: {lead_time}d  |  Safety stock: {safety_days}d  |  Sales window: {sales_days}d")
+    print(f"  Lead time: {lead_time}d  |  Safety stock: {safety_days}d  |  Sales window: {sales_days}d  |  MOQ: {moq}")
     print("=" * 60)
     for status, label in STATUS_LABELS.items():
         n = counts.get(status, 0)
@@ -360,6 +370,8 @@ def main():
                         help="Supplier lead time in days (default: 30)")
     parser.add_argument("--safety-days", type=int, default=14,
                         help="Safety stock buffer in days (default: 14)")
+    parser.add_argument("--moq",         type=int, default=1,
+                        help="Minimum order quantity - suggested orders rounded up to nearest multiple (default: 1)")
     parser.add_argument("--output-full",   default="inventory_forecast_report.csv")
     parser.add_argument("--output-action", default="reorder_now.csv")
     args = parser.parse_args()
@@ -370,6 +382,7 @@ def main():
         sales_days=args.sales_days,
         lead_time=args.lead_time,
         safety_days=args.safety_days,
+        moq=args.moq,
         output_full=args.output_full,
         output_action=args.output_action,
     )
